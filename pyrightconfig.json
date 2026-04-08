@@ -1,0 +1,8 @@
+{
+  "include": ["src"],
+  "exclude": ["plugins"],
+  "extraPaths": ["src"],
+  "pythonPath": ".venv/Scripts/python.exe",
+  "venvPath": ".",
+  "venv": ".venv"
+}

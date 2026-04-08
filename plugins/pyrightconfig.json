@@ -1,0 +1,6 @@
+{
+  "include": ["."],
+  "stubPath": "ue_python_server",
+  "reportMissingModuleSource": "none",
+  "reportMissingImports": "none"
+}

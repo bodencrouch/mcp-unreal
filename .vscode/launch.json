@@ -1,0 +1,18 @@
+{
+  "mcp-unreal": {
+    "command": "uv",
+    "args": [
+      "--directory",
+      "C:/GitHub/mcp-unreal",
+      "run",
+      "mcp-unreal"
+    ],
+    "env": {
+      "UE_BRIDGE_URL": "http://127.0.0.1:6800",
+      "UE_COMMAND_TIMEOUT": "60",
+      "UE_DISCOVERY_TIMEOUT": "5",
+      "MCP_LOG_LEVEL": "WARNING",
+      "MCP_TRANSPORT": "stdio"
+    }
+  }
+}
