@@ -11,11 +11,19 @@ from __future__ import annotations
 import json
 import logging
 import textwrap
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import mcp.types as types
 from mcp.server import Server
 
+from mcp_unreal.knowledge import (
+    build_info_prompt,
+    get_knowledge_base_text,
+    get_resource_by_uri,
+    list_knowledge_base_topics_text,
+    list_knowledge_resources,
+    search_knowledge_base_text,
+)
 from mcp_unreal.ue_remote import ExecResult, ExecMode, make_client
 
 log = logging.getLogger(__name__)
@@ -102,8 +110,105 @@ def create_server(
                     },
                     "required": ["code"],
                 },
+            ),
+            types.Tool(
+                name="list_knowledge_base_topics",
+                description=(
+                    "List the available UE5 knowledge-base topics mirrored from the local "
+                    "knowledge_base directory."
+                ),
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            types.Tool(
+                name="get_knowledge_base",
+                description=(
+                    "Read the full knowledge-base content for a topic such as ai, blueprints, "
+                    "ui, gameplay, input, or python."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "description": "Knowledge-base topic name.",
+                        }
+                    },
+                    "required": ["topic"],
+                },
+            ),
+            types.Tool(
+                name="search_knowledge_base",
+                description=(
+                    "Search across all UE5 knowledge-base documents for a keyword or phrase."
+                ),
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Free-text search query.",
+                        }
+                    },
+                    "required": ["query"],
+                },
+            ),
+        ]
+
+    @app.list_resources()
+    async def list_resources() -> list[types.Resource]:
+        return [
+            types.Resource(
+                name=resource.name,
+                title=resource.title,
+                uri=cast(Any, resource.uri),
+                description=resource.description,
+                mimeType=resource.mime_type,
+                size=resource.path.stat().st_size,
+            )
+            for resource in list_knowledge_resources()
+        ]
+
+    @app.read_resource()
+    async def read_resource(uri: Any) -> str:
+        resource = get_resource_by_uri(str(uri))
+        if resource is None:
+            raise ValueError(f"Unknown resource: {uri}")
+        return resource.path.read_text(encoding="utf-8")
+
+    @app.list_prompts()
+    async def list_prompts() -> list[types.Prompt]:
+        return [
+            types.Prompt(
+                name="info",
+                description=(
+                    "Ghost-inspired overview prompt describing mcp-unreal tools, resources, "
+                    "and the execute-script workflow."
+                ),
+                arguments=[
+                    types.PromptArgument(
+                        name="task",
+                        description="Optional current UE5 task for prompt context.",
+                        required=False,
+                    )
+                ],
             )
         ]
+
+    @app.get_prompt()
+    async def get_prompt(name: str, arguments: dict[str, str] | None) -> types.GetPromptResult:
+        if name != "info":
+            raise ValueError(f"Unknown prompt: {name}")
+
+        prompt_text = build_info_prompt(arguments)
+        return types.GetPromptResult(
+            description="Overview of mcp-unreal's execute-script and knowledge surfaces.",
+            messages=[
+                types.PromptMessage(
+                    role="user",
+                    content=types.TextContent(type="text", text=prompt_text),
+                )
+            ],
+        )
 
     # ------------------------------------------------------------------
     # Tool execution
@@ -113,6 +218,32 @@ def create_server(
     async def call_tool(
         name: str, arguments: dict[str, Any]
     ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
+        if name == "list_knowledge_base_topics":
+            return [
+                types.TextContent(
+                    type="text",
+                    text=list_knowledge_base_topics_text(),
+                )
+            ]
+
+        if name == "get_knowledge_base":
+            topic = arguments.get("topic", "")
+            return [
+                types.TextContent(
+                    type="text",
+                    text=get_knowledge_base_text(topic),
+                )
+            ]
+
+        if name == "search_knowledge_base":
+            query = arguments.get("query", "")
+            return [
+                types.TextContent(
+                    type="text",
+                    text=search_knowledge_base_text(query),
+                )
+            ]
+
         if name != "execute-script":
             raise ValueError(f"Unknown tool: {name}")
 

@@ -34,6 +34,11 @@ GET /ping
 
 POST /ping
     Same as GET /ping.
+
+POST /ghost_command
+    Body: {"type": "ghost_command_name", "params": {...}}
+    Returns: {"status": "success", "result": {...}} or
+             {"status": "error", "error": "..."}
 """
 
 from __future__ import annotations
@@ -45,7 +50,7 @@ import queue
 import threading
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -61,8 +66,8 @@ _thread: Optional[threading.Thread] = None
 _exec_ns: dict[str, Any] = {"__name__": "__main__", "__builtins__": __builtins__}
 _exec_ns_lock = threading.Lock()
 
-# Game-thread dispatch: background threads post (code, exec_mode, event, result_box)
-# and the Slate tick callback picks them up on the main game thread.
+# Game-thread dispatch: background threads post callables and the Slate tick
+# callback runs them on the main game thread.
 _dispatch_queue: queue.Queue = queue.Queue()
 _tick_handle: Any = None
 
@@ -108,22 +113,22 @@ def _game_thread_tick(delta: float) -> None:
     """Called every Slate tick on the game thread. Drains the dispatch queue."""
     while True:
         try:
-            code, exec_mode, done_event, result_box = _dispatch_queue.get_nowait()
+            callback, done_event, result_box = _dispatch_queue.get_nowait()
         except queue.Empty:
             break
         try:
-            result_box.append(_execute_direct(code, exec_mode))
+            result_box.append(callback())
         except Exception:  # noqa: BLE001
             result_box.append({"success": False, "output": [], "error": traceback.format_exc()})
         finally:
             done_event.set()
 
 
-def _dispatch_to_game_thread(code: str, exec_mode: str, timeout: float = 60.0) -> dict:
-    """Post *code* to the game thread and block until it finishes."""
+def _dispatch_to_game_thread(callback: Callable[[], dict], timeout: float = 60.0) -> dict:
+    """Post *callback* to the game thread and block until it finishes."""
     done = threading.Event()
     result_box: list[dict] = []
-    _dispatch_queue.put((code, exec_mode, done, result_box))
+    _dispatch_queue.put((callback, done, result_box))
     if not done.wait(timeout):
         return {"success": False, "output": [], "error": f"Game-thread execution timed out after {timeout}s"}
     return result_box[0] if result_box else {"success": False, "output": [], "error": "No result"}
@@ -167,6 +172,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if self.path == "/execute_python":
             self._handle_execute()
+        elif self.path == "/ghost_command":
+            self._handle_ghost_command()
         elif self.path == "/ping":
             self._send_json({"status": "ok", "engine": _engine_version()})
         else:
@@ -193,9 +200,30 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # If a game-thread tick is registered, dispatch there for full unreal API access.
         # Fall back to direct (background-thread) execution when running outside UE.
         if _tick_handle is not None:
-            result = _dispatch_to_game_thread(code, exec_mode)
+            result = _dispatch_to_game_thread(lambda: _execute_direct(code, exec_mode))
         else:
             result = _execute_direct(code, exec_mode)
+        self._send_json(result)
+
+    def _handle_ghost_command(self) -> None:
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length)
+        try:
+            req: dict = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            self._send_json(_ghost_error(f"Invalid JSON body: {exc}"), 400)
+            return
+
+        command = str(req.get("type", "")).strip()
+        params = req.get("params") or {}
+        if not command:
+            self._send_json(_ghost_error("Missing command type."), 400)
+            return
+
+        if _tick_handle is not None:
+            result = _dispatch_to_game_thread(lambda: _execute_ghost_command(command, params))
+        else:
+            result = _execute_ghost_command(command, params)
         self._send_json(result)
 
     def _send_json(self, data: dict, status: int = 200) -> None:
@@ -304,6 +332,362 @@ def _execute_direct(code: str, exec_mode: str) -> dict:
         result["result"] = repr(return_value)
 
     return result
+
+
+def _ghost_success(result: Optional[dict] = None) -> dict:
+    return {"status": "success", "result": result or {}}
+
+
+def _ghost_error(message: str) -> dict:
+    return {"status": "error", "error": message}
+
+
+def _execute_ghost_command(command: str, params: dict) -> dict:
+    handlers: dict[str, Callable[[dict], dict]] = {
+        "get_actors_in_level": _ghost_get_actors_in_level,
+        "find_actors_by_name": _ghost_find_actors_by_name,
+        "spawn_actor": _ghost_spawn_actor,
+        "delete_actor": _ghost_delete_actor,
+        "set_actor_transform": _ghost_set_actor_transform,
+        "get_actor_properties": _ghost_get_actor_properties,
+        "set_actor_property": _ghost_set_actor_property,
+        "spawn_blueprint_actor": _ghost_spawn_blueprint_actor,
+        "create_blueprint": _ghost_create_blueprint,
+        "compile_blueprint": _ghost_compile_blueprint,
+        "set_blueprint_property": _ghost_set_blueprint_property,
+        "set_blueprint_ai_controller": _ghost_set_blueprint_ai_controller,
+        "focus_viewport": _ghost_focus_viewport,
+        "take_screenshot": _ghost_take_screenshot,
+    }
+
+    if command == "exec_python":
+        result = _execute_direct(
+            str(params.get("code", "")),
+            str(params.get("mode", "ExecuteStatement")),
+        )
+        output_lines = [entry.get("output", "") for entry in result.get("output", []) if entry.get("output")]
+        if result.get("result") not in (None, ""):
+            output_lines.append(f"Return: {result['result']}")
+        inner = {
+            "success": bool(result.get("success", False) and not result.get("error")),
+            "output": "\n".join(output_lines).strip(),
+            "result": result.get("result"),
+        }
+        if result.get("error"):
+            inner["error"] = result["error"]
+        return _ghost_success(inner)
+
+    handler = handlers.get(command)
+    if handler is None:
+        return _ghost_error(
+            f"Command '{command}' is not implemented by the HTTP Ghost bridge yet. "
+            "Use the plugin backend on port 55557 for full Ghost coverage, or use exec_python where appropriate."
+        )
+
+    try:
+        return handler(params or {})
+    except Exception:  # noqa: BLE001
+        return _ghost_error(traceback.format_exc())
+
+
+def _get_all_level_actors() -> list[Any]:
+    import unreal  # type: ignore
+
+    try:
+        subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+        return list(subsystem.get_all_level_actors())
+    except Exception:
+        return list(unreal.EditorLevelLibrary.get_all_level_actors())
+
+
+def _find_actor(name: str) -> Any:
+    lowered = name.lower()
+    for actor in _get_all_level_actors():
+        if actor.get_name().lower() == lowered or actor.get_actor_label().lower() == lowered:
+            return actor
+    return None
+
+
+def _serialize_actor(actor: Any) -> dict:
+    location = actor.get_actor_location()
+    rotation = actor.get_actor_rotation()
+    scale = actor.get_actor_scale3d()
+    return {
+        "name": actor.get_actor_label(),
+        "object_name": actor.get_name(),
+        "type": actor.get_class().get_name(),
+        "location": [float(location.x), float(location.y), float(location.z)],
+        "rotation": [float(rotation.pitch), float(rotation.yaw), float(rotation.roll)],
+        "scale": [float(scale.x), float(scale.y), float(scale.z)],
+    }
+
+
+def _vector(values: list[Any], default: tuple[float, float, float]) -> Any:
+    import unreal  # type: ignore
+
+    source = list(values or default)
+    source.extend(list(default[len(source):]))
+    return unreal.Vector(float(source[0]), float(source[1]), float(source[2]))
+
+
+def _rotator(values: list[Any], default: tuple[float, float, float]) -> Any:
+    import unreal  # type: ignore
+
+    source = list(values or default)
+    source.extend(list(default[len(source):]))
+    return unreal.Rotator(float(source[0]), float(source[1]), float(source[2]))
+
+
+def _resolve_class(name: str) -> Any:
+    import unreal  # type: ignore
+
+    candidate = getattr(unreal, name, None)
+    if candidate is not None:
+        return candidate
+
+    search_paths = [
+        f"/Script/Engine.{name}",
+        f"/Script/CoreUObject.{name}",
+        f"/Script/UMG.{name}",
+        f"/Script/AIModule.{name}",
+        f"/Script/NavigationSystem.{name}",
+        f"/Script/GameplayTasks.{name}",
+        f"/Script/EnhancedInput.{name}",
+    ]
+    for path in search_paths:
+        loaded = unreal.load_class(None, path)
+        if loaded is not None:
+            return loaded
+    return None
+
+
+def _find_blueprint_asset(blueprint_name: str) -> Any:
+    import unreal  # type: ignore
+
+    common_paths = [
+        f"/Game/Blueprints/{blueprint_name}",
+        f"/Game/{blueprint_name}",
+    ]
+    for path in common_paths:
+        asset = unreal.EditorAssetLibrary.load_asset(path)
+        if asset is not None:
+            return asset
+
+    try:
+        registry = unreal.AssetRegistryHelpers.get_asset_registry()
+        for asset_data in registry.get_assets_by_class(unreal.TopLevelAssetPath("/Script/Engine", "Blueprint")):
+            if str(asset_data.asset_name) == blueprint_name:
+                return asset_data.get_asset()
+    except Exception:
+        pass
+    return None
+
+
+def _coerce_property_value(value: Any) -> Any:
+    return value
+
+
+def _ghost_get_actors_in_level(params: dict) -> dict:
+    actors = [_serialize_actor(actor) for actor in _get_all_level_actors()]
+    return _ghost_success({"actors": actors})
+
+
+def _ghost_find_actors_by_name(params: dict) -> dict:
+    pattern = str(params.get("pattern", "")).lower()
+    matches = []
+    for actor in _get_all_level_actors():
+        if pattern in actor.get_name().lower() or pattern in actor.get_actor_label().lower():
+            matches.append(actor.get_actor_label())
+    return _ghost_success({"actors": matches})
+
+
+def _ghost_spawn_actor(params: dict) -> dict:
+    import unreal  # type: ignore
+
+    actor_class = _resolve_class(str(params.get("type", "")))
+    if actor_class is None:
+        return _ghost_error(f"Unknown actor class '{params.get('type', '')}'")
+
+    actor = unreal.EditorLevelLibrary.spawn_actor_from_class(
+        actor_class,
+        _vector(params.get("location", [0.0, 0.0, 0.0]), (0.0, 0.0, 0.0)),
+        _rotator(params.get("rotation", [0.0, 0.0, 0.0]), (0.0, 0.0, 0.0)),
+    )
+    if actor is None:
+        return _ghost_error("Failed to spawn actor")
+
+    if params.get("name"):
+        actor.set_actor_label(str(params["name"]))
+    return _ghost_success(_serialize_actor(actor))
+
+
+def _ghost_delete_actor(params: dict) -> dict:
+    import unreal  # type: ignore
+
+    actor = _find_actor(str(params.get("name", "")))
+    if actor is None:
+        return _ghost_error(f"Actor '{params.get('name', '')}' not found")
+    unreal.EditorLevelLibrary.destroy_actor(actor)
+    return _ghost_success({"success": True, "name": str(params.get("name", ""))})
+
+
+def _ghost_set_actor_transform(params: dict) -> dict:
+    actor = _find_actor(str(params.get("name", "")))
+    if actor is None:
+        return _ghost_error(f"Actor '{params.get('name', '')}' not found")
+    if params.get("location") is not None:
+        actor.set_actor_location(_vector(params.get("location", [0.0, 0.0, 0.0]), (0.0, 0.0, 0.0)))
+    if params.get("rotation") is not None:
+        actor.set_actor_rotation(_rotator(params.get("rotation", [0.0, 0.0, 0.0]), (0.0, 0.0, 0.0)))
+    if params.get("scale") is not None:
+        actor.set_actor_scale3d(_vector(params.get("scale", [1.0, 1.0, 1.0]), (1.0, 1.0, 1.0)))
+    return _ghost_success(_serialize_actor(actor))
+
+
+def _ghost_get_actor_properties(params: dict) -> dict:
+    actor = _find_actor(str(params.get("name", "")))
+    if actor is None:
+        return _ghost_error(f"Actor '{params.get('name', '')}' not found")
+    return _ghost_success(_serialize_actor(actor))
+
+
+def _ghost_set_actor_property(params: dict) -> dict:
+    actor = _find_actor(str(params.get("name", "")))
+    if actor is None:
+        return _ghost_error(f"Actor '{params.get('name', '')}' not found")
+    actor.set_editor_property(str(params.get("property_name", "")), _coerce_property_value(params.get("property_value")))
+    return _ghost_success({
+        "success": True,
+        "name": str(params.get("name", "")),
+        "property_name": str(params.get("property_name", "")),
+        "property_value": params.get("property_value"),
+    })
+
+
+def _ghost_spawn_blueprint_actor(params: dict) -> dict:
+    import unreal  # type: ignore
+
+    blueprint = _find_blueprint_asset(str(params.get("blueprint_name", "")))
+    if blueprint is None:
+        return _ghost_error(f"Blueprint '{params.get('blueprint_name', '')}' not found")
+    actor_class = getattr(blueprint, "generated_class", None)
+    if actor_class is None:
+        return _ghost_error(f"Blueprint '{params.get('blueprint_name', '')}' has no generated class")
+
+    actor = unreal.EditorLevelLibrary.spawn_actor_from_class(
+        actor_class,
+        _vector(params.get("location", [0.0, 0.0, 0.0]), (0.0, 0.0, 0.0)),
+        _rotator(params.get("rotation", [0.0, 0.0, 0.0]), (0.0, 0.0, 0.0)),
+    )
+    if actor is None:
+        return _ghost_error("Failed to spawn Blueprint actor")
+
+    if params.get("actor_name"):
+        actor.set_actor_label(str(params["actor_name"]))
+    return _ghost_success(_serialize_actor(actor))
+
+
+def _ghost_create_blueprint(params: dict) -> dict:
+    import unreal  # type: ignore
+
+    parent_class = _resolve_class(str(params.get("parent_class", "")))
+    if parent_class is None:
+        return _ghost_error(f"Unknown parent class '{params.get('parent_class', '')}'")
+
+    factory = unreal.BlueprintFactory()
+    factory.set_editor_property("ParentClass", parent_class)
+    asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
+    package_path = "/Game/Blueprints"
+    blueprint = asset_tools.create_asset(str(params.get("name", "")), package_path, unreal.Blueprint, factory)
+    if blueprint is None:
+        return _ghost_error("Failed to create Blueprint asset")
+
+    unreal.EditorAssetLibrary.save_loaded_asset(blueprint)
+    return _ghost_success({
+        "success": True,
+        "name": str(params.get("name", "")),
+        "path": f"{package_path}/{params.get('name', '')}",
+    })
+
+
+def _ghost_compile_blueprint(params: dict) -> dict:
+    import unreal  # type: ignore
+
+    blueprint = _find_blueprint_asset(str(params.get("blueprint_name", "")))
+    if blueprint is None:
+        return _ghost_error(f"Blueprint '{params.get('blueprint_name', '')}' not found")
+    unreal.KismetEditorUtilities.compile_blueprint(blueprint)
+    unreal.EditorAssetLibrary.save_loaded_asset(blueprint)
+    return _ghost_success({
+        "success": True,
+        "blueprint_name": str(params.get("blueprint_name", "")),
+        "compiled": True,
+    })
+
+
+def _ghost_set_blueprint_property(params: dict) -> dict:
+    blueprint = _find_blueprint_asset(str(params.get("blueprint_name", "")))
+    if blueprint is None:
+        return _ghost_error(f"Blueprint '{params.get('blueprint_name', '')}' not found")
+    generated_class = getattr(blueprint, "generated_class", None)
+    if generated_class is None:
+        return _ghost_error(f"Blueprint '{params.get('blueprint_name', '')}' has no generated class")
+    default_object = generated_class.get_default_object()
+    default_object.set_editor_property(
+        str(params.get("property_name", "")),
+        _coerce_property_value(params.get("property_value")),
+    )
+    return _ghost_success({
+        "success": True,
+        "blueprint_name": str(params.get("blueprint_name", "")),
+        "property_name": str(params.get("property_name", "")),
+        "property_value": params.get("property_value"),
+    })
+
+
+def _ghost_set_blueprint_ai_controller(params: dict) -> dict:
+    blueprint = _find_blueprint_asset(str(params.get("blueprint_name", "")))
+    if blueprint is None:
+        return _ghost_error(f"Blueprint '{params.get('blueprint_name', '')}' not found")
+    generated_class = getattr(blueprint, "generated_class", None)
+    if generated_class is None:
+        return _ghost_error(f"Blueprint '{params.get('blueprint_name', '')}' has no generated class")
+    controller_class = _resolve_class(str(params.get("controller_class", "AIController")))
+    if controller_class is None:
+        return _ghost_error(f"Unknown controller class '{params.get('controller_class', 'AIController')}'")
+    default_object = generated_class.get_default_object()
+    default_object.set_editor_property("ai_controller_class", controller_class)
+    return _ghost_success({
+        "success": True,
+        "blueprint_name": str(params.get("blueprint_name", "")),
+        "ai_controller_class": str(params.get("controller_class", "AIController")),
+    })
+
+
+def _ghost_focus_viewport(params: dict) -> dict:
+    import unreal  # type: ignore
+
+    actor = _find_actor(str(params.get("name", "")))
+    if actor is None:
+        return _ghost_error(f"Actor '{params.get('name', '')}' not found")
+    try:
+        unreal.EditorLevelLibrary.set_selected_level_actors([actor])
+    except Exception:
+        pass
+    return _ghost_success({"success": True, "focused_actor": actor.get_actor_label()})
+
+
+def _ghost_take_screenshot(params: dict) -> dict:
+    import unreal  # type: ignore
+
+    filename = str(params.get("filename", "ghost_screenshot"))
+    resolution = params.get("resolution", [1920, 1080])
+    width = int(resolution[0]) if len(resolution) > 0 else 1920
+    height = int(resolution[1]) if len(resolution) > 1 else 1080
+    if hasattr(unreal, "AutomationLibrary"):
+        unreal.AutomationLibrary.take_high_res_screenshot(width, height, filename)
+        return _ghost_success({"success": True, "filename": filename})
+    return _ghost_error("AutomationLibrary is not available for screenshots in this editor session")
 
 
 # ---------------------------------------------------------------------------
