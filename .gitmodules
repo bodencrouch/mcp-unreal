@@ -1,0 +1,4 @@
+[submodule "vendor/Unreal-MCP-Ghost"]
+	path = vendor/Unreal-MCP-Ghost
+	url = https://github.com/CrispyW0nton/Unreal-MCP-Ghost.git
+	branch = genspark_ai_developer
