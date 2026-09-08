@@ -9,3 +9,9 @@ build/
 .eggs/
 =
 unreal_mcp.log
+.claude/
+.cursor/
+.mission/
+.remember/
+AGENTS.md
+CLAUDE.md
